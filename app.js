@@ -2,7 +2,9 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const PROC_MAX = 3000;            // tamaño máximo de la página procesada (px)
+const APP_VERSION = '2';
+const PROC_MAX = 2600;            // tamaño máximo de la página procesada (px)
+const CAPTURE_MAX = 2600;         // tamaño máximo de la foto guardada (px)
 const QUALITY = {
   alta:  { max: 2400, q: 0.88 },
   media: { max: 1600, q: 0.72 },
@@ -12,6 +14,7 @@ const QUALITY = {
 /* ------------------------------------------------------------------ */
 /* Utilidades                                                          */
 /* ------------------------------------------------------------------ */
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 function pad(n) { return String(n).padStart(2, '0'); }
 function autoName(d = new Date()) {
@@ -72,40 +75,72 @@ function imageToPixels(img, maxDim) {
 /* Base de datos local (IndexedDB)                                     */
 /* ------------------------------------------------------------------ */
 const DB = (() => {
-  let dbp;
+  // Safari en iPhone a veces cierra la conexión (al pasar a segundo plano, al pedir la cámara…).
+  // Por eso: si está cerrada, se vuelve a abrir y se repite la operación.
+  // Las imágenes se guardan como ArrayBuffer, que Safari guarda con más fiabilidad que los Blob.
+  let dbp = null;
   function open() {
     if (dbp) return dbp;
     dbp = new Promise((resolve, reject) => {
       const req = indexedDB.open('escaner', 1);
       req.onupgradeneeded = () => {
         const db = req.result;
-        db.createObjectStore('docs', { keyPath: 'id' });
-        const p = db.createObjectStore('pages', { keyPath: 'id' });
-        p.createIndex('docId', 'docId');
+        if (!db.objectStoreNames.contains('docs')) db.createObjectStore('docs', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('pages')) {
+          const p = db.createObjectStore('pages', { keyPath: 'id' });
+          p.createIndex('docId', 'docId');
+        }
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onclose = () => { dbp = null; };
+        db.onversionchange = () => { try { db.close(); } catch {} dbp = null; };
+        resolve(db);
+      };
+      req.onerror = () => { dbp = null; reject(req.error); };
+      req.onblocked = () => { dbp = null; reject(new Error('base de datos bloqueada')); };
     });
     return dbp;
   }
-  async function tx(store, mode, fn) {
-    const db = await open();
-    return new Promise((resolve, reject) => {
-      const t = db.transaction(store, mode);
-      const s = t.objectStore(store);
-      const r = fn(s);
-      t.oncomplete = () => resolve(r && 'result' in r ? r.result : undefined);
-      t.onerror = () => reject(t.error);
-      t.onabort = () => reject(t.error);
-    });
+  async function tx(store, mode, fn, attempt = 0) {
+    let db;
+    try { db = await open(); } catch (e) { if (attempt < 2) { dbp = null; await sleep(150); return tx(store, mode, fn, attempt + 1); } throw e; }
+    try {
+      return await new Promise((resolve, reject) => {
+        const t = db.transaction(store, mode);
+        const s = t.objectStore(store);
+        const r = fn(s);
+        t.oncomplete = () => resolve(r && 'result' in r ? r.result : undefined);
+        t.onerror = () => reject(t.error || new Error('error en la base de datos'));
+        t.onabort = () => reject(t.error || new Error('operación cancelada'));
+      });
+    } catch (e) {
+      if (attempt < 2) {
+        try { db.close(); } catch {}
+        dbp = null; await sleep(150);
+        return tx(store, mode, fn, attempt + 1);
+      }
+      throw e;
+    }
+  }
+  const BLOBS = ['orig', 'proc', 'thumb'];
+  async function pack(page) {
+    const o = Object.assign({}, page);
+    for (const k of BLOBS) if (o[k] instanceof Blob) o[k] = { buf: await o[k].arrayBuffer(), type: o[k].type || 'image/jpeg' };
+    return o;
+  }
+  function unpack(o) {
+    if (!o) return o;
+    for (const k of BLOBS) if (o[k] && o[k].buf) o[k] = new Blob([o[k].buf], { type: o[k].type });
+    return o;
   }
   return {
     getDoc: (id) => tx('docs', 'readonly', (s) => s.get(id)),
     allDocs: () => tx('docs', 'readonly', (s) => s.getAll()),
     putDoc: (d) => tx('docs', 'readwrite', (s) => s.put(d)),
     delDoc: (id) => tx('docs', 'readwrite', (s) => s.delete(id)),
-    getPage: (id) => tx('pages', 'readonly', (s) => s.get(id)),
-    putPage: (p) => tx('pages', 'readwrite', (s) => s.put(p)),
+    getPage: async (id) => unpack(await tx('pages', 'readonly', (s) => s.get(id))),
+    putPage: async (p) => { const o = await pack(p); return tx('pages', 'readwrite', (s) => s.put(o)); },
     delPage: (id) => tx('pages', 'readwrite', (s) => s.delete(id)),
   };
 })();
@@ -114,35 +149,62 @@ const DB = (() => {
 /* Trabajador con OpenCV                                               */
 /* ------------------------------------------------------------------ */
 const Engine = (() => {
-  const worker = new Worker('worker.js');
-  let seq = 0; const pending = new Map();
-  worker.onmessage = (e) => {
-    const m = e.data; const p = pending.get(m.id); if (!p) return;
-    pending.delete(m.id);
-    m.ok ? p.resolve(m) : p.reject(new Error(m.error));
-  };
-  worker.onerror = (e) => { console.error('worker', e); };
-  function call(msg, transfer) {
+  let worker = null, seq = 0;
+  const pending = new Map();
+  let readyP = null, isReady = false, lastError = '';
+  function failAll(msg) {
+    for (const [, p] of pending) { clearTimeout(p.timer); p.reject(new Error(msg)); }
+    pending.clear();
+  }
+  function spawn() {
+    worker = new Worker('worker.js');
+    worker.onmessage = (e) => {
+      const m = e.data; const p = pending.get(m.id); if (!p) return;
+      pending.delete(m.id); clearTimeout(p.timer);
+      if (m.ok) p.resolve(m); else { lastError = m.error; p.reject(new Error(m.error)); }
+    };
+    worker.onerror = (e) => {
+      lastError = (e && e.message) || 'el motor se ha detenido';
+      restart(lastError);
+    };
+  }
+  // Si el motor se cuelga o se cierra, se arranca de nuevo
+  function restart(msg) {
+    try { worker && worker.terminate(); } catch {}
+    failAll(msg || 'el motor se ha reiniciado');
+    readyP = null; isReady = false;
+    spawn();
+  }
+  spawn();
+  function call(msg, transfer, timeoutMs) {
     const id = ++seq;
     return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        lastError = 'el motor tarda demasiado';
+        reject(new Error(lastError));
+        restart(lastError);
+      }, timeoutMs);
+      pending.set(id, { resolve, reject, timer });
       worker.postMessage(Object.assign({ id }, msg), transfer || []);
     });
   }
-  let readyP = null, isReady = false;
   function ready() {
-    if (!readyP) readyP = call({ type: 'init' }).then(() => { isReady = true; }, (e) => { readyP = null; throw e; });
+    if (!readyP) readyP = call({ type: 'init' }, null, 120000).then(() => { isReady = true; }, (e) => { readyP = null; throw e; });
     return readyP;
   }
-  function detect(imageData, maxDim) {
+  async function detect(imageData, maxDim) {
+    await ready();
     const buf = imageData.data.buffer;
-    return call({ type: 'detect', w: imageData.width, h: imageData.height, buffer: buf, maxDim }, [buf]).then((r) => r.quad);
+    return call({ type: 'detect', w: imageData.width, h: imageData.height, buffer: buf, maxDim }, [buf], 8000).then((r) => r.quad);
   }
-  function process(imageData, opts) {
+  async function process(imageData, opts) {
+    await ready();
     const buf = imageData.data.buffer;
-    return call(Object.assign({ type: 'process', w: imageData.width, h: imageData.height, buffer: buf }, opts), [buf]);
+    return call(Object.assign({ type: 'process', w: imageData.width, h: imageData.height, buffer: buf }, opts), [buf], 45000);
   }
-  return { ready, detect, process, get isReady() { return isReady; } };
+  return { ready, detect, process, get isReady() { return isReady; }, get lastError() { return lastError; } };
 })();
 
 /* Genera la imagen final de una página (enderezada + filtro + giro) y su miniatura */
@@ -249,7 +311,7 @@ const Camera = (() => {
   const small = document.createElement('canvas');
   const sg = small.getContext('2d', { willReadFrequently: true });
   let stream = null, track = null, running = false, busy = false, torchOn = false;
-  let liveQuad = null, shownQuad = null, missCount = 0, lastDetect = 0;
+  let liveQuad = null, shownQuad = null, missCount = 0, lastDetect = 0, detectError = '';
   let docId = null, count = 0, lastThumb = null;
 
   async function start(targetDocId) {
@@ -324,7 +386,8 @@ const Camera = (() => {
         q = q.map((p) => ({ x: p.x / k, y: p.y / k }));
         liveQuad = q; missCount = 0;
       } else if (++missCount > 4) liveQuad = null;
-    }).catch(() => {}).finally(() => { busy = false; });
+      detectError = '';
+    }).catch((e) => { detectError = e.message; liveQuad = null; }).finally(() => { busy = false; });
   }
 
   function draw() {
@@ -337,7 +400,7 @@ const Camera = (() => {
     if (liveQuad) {
       shownQuad = shownQuad ? shownQuad.map((p, i) => ({ x: p.x + (liveQuad[i].x - p.x) * 0.45, y: p.y + (liveQuad[i].y - p.y) * 0.45 })) : liveQuad;
     } else shownQuad = null;
-    $('camHint').textContent = shownQuad ? 'Hoja detectada' : 'Buscando la hoja…';
+    $('camHint').textContent = detectError ? 'Error del motor: ' + detectError : (shownQuad ? 'Hoja detectada' : 'Buscando la hoja…');
     if (!shownQuad || !video.videoWidth) return;
     const m = mapping();
     const pts = shownQuad.map((p) => ({ x: m.ox + p.x * m.s, y: m.oy + p.y * m.s }));
@@ -353,10 +416,12 @@ const Camera = (() => {
     const btn = $('shutter'); btn.disabled = true;
     const f = $('flash'); f.classList.add('go'); requestAnimationFrame(() => requestAnimationFrame(() => f.classList.remove('go')));
     try {
-      const W = video.videoWidth, H = video.videoHeight;
+      const VW = video.videoWidth, VH = video.videoHeight;
+      const ks = Math.min(1, CAPTURE_MAX / Math.max(VW, VH));
+      const W = Math.round(VW * ks), H = Math.round(VH * ks);
       const c = document.createElement('canvas'); c.width = W; c.height = H;
       const g = c.getContext('2d', { willReadFrequently: true });
-      g.drawImage(video, 0, 0);
+      g.drawImage(video, 0, 0, W, H);
       const pixels = g.getImageData(0, 0, W, H);
       const orig = await canvasToBlob(c, 0.92);
       c.width = c.height = 0;
@@ -371,7 +436,7 @@ const Camera = (() => {
 
       const page = {
         id: uid(), docId, orig, w: W, h: H, quad: null, auto: true, rot: 0,
-        filter: getPref('filter', 'sombras'), fallback: liveQuad ? liveQuad.map((p) => ({ ...p })) : null,
+        filter: getPref('filter', 'sombras'), fallback: liveQuad ? liveQuad.map((p) => ({ x: p.x * ks, y: p.y * ks })) : null,
       };
       await DB.putPage(page);
       doc.pages.push(page.id); doc.updated = Date.now();
@@ -773,6 +838,7 @@ $('exportShare').onclick = async () => {
   const standalone = window.navigator.standalone || matchMedia('(display-mode: standalone)').matches;
   const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
   if (ios && !standalone) $('installHint').style.display = 'block';
+  $('appVersion').textContent = 'versión ' + APP_VERSION;
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   renderHome().catch((e) => { $('docList').innerHTML = `<div class="empty">No se puede abrir el almacenamiento del móvil (${e.message}).</div>`; });

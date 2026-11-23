@@ -1,5 +1,5 @@
 /* Permite usar la app sin internet: guarda sus ficheros y el motor de escaneo */
-const CACHE = 'escaner-v1';
+const CACHE = 'escaner-v2';
 const OPENCV_URL = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@5.0.0-release.1/dist/opencv.js';
 const LOCAL = ['./', 'index.html', 'app.js', 'engine.js', 'worker.js', 'manifest.webmanifest', 'icon.svg'];
 

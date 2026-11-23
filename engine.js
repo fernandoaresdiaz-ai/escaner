@@ -57,129 +57,159 @@
     return pts;
   }
 
-  // Busca el mejor cuadrilátero en una imagen binaria
-  function bestQuadFromBinary(cv, bin, imgArea, minFrac) {
+  // Reduce un polígono convexo a 4 vértices quitando cada vez el que menos área aporta
+  function reduceToQuad(pts) {
+    const p = pts.slice();
+    const triArea = (a, b, c) => Math.abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) / 2;
+    while (p.length > 4) {
+      let bi = 0, ba = Infinity;
+      for (let i = 0; i < p.length; i++) {
+        const a = triArea(p[(i - 1 + p.length) % p.length], p[i], p[(i + 1) % p.length]);
+        if (a < ba) { ba = a; bi = i; }
+      }
+      p.splice(bi, 1);
+    }
+    return p;
+  }
+
+  // Busca cuadriláteros candidatos en una imagen binaria
+  function quadsFromBinary(cv, bin, imgArea, minFrac, mode, out) {
     const contours = new cv.MatVector();
     const hier = new cv.Mat();
-    cv.findContours(bin, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
-    let best = null, bestArea = 0;
+    cv.findContours(bin, contours, hier, mode, cv.CHAIN_APPROX_SIMPLE);
+    const list = [];
     for (let i = 0; i < contours.size(); i++) {
       const c = contours.get(i);
       const area = cv.contourArea(c);
-      if (area < imgArea * minFrac) { c.delete(); continue; }
-      const hull = new cv.Mat();
-      cv.convexHull(c, hull, false, true);
-      const peri = cv.arcLength(hull, true);
-      let quad = null;
-      for (const eps of [0.015, 0.02, 0.03, 0.045, 0.06]) {
-        const approx = new cv.Mat();
-        cv.approxPolyDP(hull, approx, eps * peri, true);
-        const n = approx.rows;
-        if (n === 4) quad = matToPoints(approx);
-        approx.delete();
-        if (n <= 4) break;
-      }
-      if (!quad) {
-        // Plan B: los 4 puntos extremos del contorno convexo
+      if (area >= imgArea * minFrac) list.push({ c, area }); else c.delete();
+    }
+    list.sort((a, b) => b.area - a.area);
+    list.forEach(({ c }, idx) => {
+      if (idx < 6) {
+        const hull = new cv.Mat();
+        cv.convexHull(c, hull, false, true);
         const hp = matToPoints(hull);
+        const hullArea = cv.contourArea(hull);
+        hull.delete();
         if (hp.length >= 4) {
-          const pick = f => hp.reduce((b, p) => (f(p) > f(b) ? p : b), hp[0]);
-          quad = [pick(p => -(p.x + p.y)), pick(p => p.x - p.y), pick(p => p.x + p.y), pick(p => p.y - p.x)];
-          // Solo vale si el contorno se parece mucho a ese cuadrilátero
-          if (polyArea(quad) < cv.contourArea(hull) * 0.9) quad = null;
+          const q = orderPoints(reduceToQuad(hp));
+          const qa = polyArea(q);
+          if (isConvexQuad(q) && minAngleDeg(q) > 40 && qa > imgArea * minFrac && qa > hullArea * 0.85) out.push(q);
         }
       }
-      hull.delete(); c.delete();
-      if (!quad) continue;
-      quad = orderPoints(quad);
-      if (!isConvexQuad(quad) || minAngleDeg(quad) < 35) continue;
-      const qa = polyArea(quad);
-      if (qa > bestArea) { bestArea = qa; best = quad; }
-    }
+      c.delete();
+    });
     contours.delete(); hier.delete();
-    return best ? { quad: best, area: bestArea } : null;
+  }
+
+  // ¿Cuánto de cada lado del cuadrilátero coincide con un borde real de la imagen?
+  function edgeSupport(mag, w, h, thr, q) {
+    let minSide = 1, total = 0;
+    for (let s = 0; s < 4; s++) {
+      const a = q[s], b = q[(s + 1) % 4];
+      const n = 48; let hit = 0, cnt = 0;
+      for (let i = 2; i < n - 2; i++) {
+        const t = i / n;
+        const x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t;
+        let best = 0;
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+          const xi = Math.round(x + dx), yi = Math.round(y + dy);
+          if (xi >= 0 && yi >= 0 && xi < w && yi < h) best = Math.max(best, mag[yi * w + xi]);
+        }
+        cnt++; if (best >= thr) hit++;
+      }
+      const f = hit / cnt; total += f; minSide = Math.min(minSide, f);
+    }
+    return { mean: total / 4, min: minSide };
   }
 
   /* Detecta la hoja. src: cv.Mat RGBA. Devuelve 4 puntos en coordenadas de src, o null. */
   function detectQuad(cv, src, opts) {
     opts = opts || {};
     const maxDim = opts.maxDim || 480;
-    const minFrac = opts.minFrac || 0.12;
+    const minFrac = opts.minFrac || 0.1;
     const scale = Math.min(1, maxDim / Math.max(src.cols, src.rows));
     const small = new cv.Mat();
     cv.resize(src, small, new cv.Size(Math.round(src.cols * scale), Math.round(src.rows * scale)), 0, 0, cv.INTER_AREA);
-    const gray = new cv.Mat();
-    cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY);
-    // borde negro de 2px para que se cierren hojas que tocan el borde de la foto
-    const blur = new cv.Mat();
-    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
-    const imgArea = gray.rows * gray.cols;
-    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-    const kernelBig = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7));
+    const PAD = 4; // margen para cerrar hojas que tocan el borde de la imagen
+    const rgb = new cv.Mat();
+    cv.cvtColor(small, rgb, cv.COLOR_RGBA2RGB);
+    const W = rgb.cols, H = rgb.rows;
+    const imgArea = W * H;
+
+    // canales: gris + saturación (el papel blanco tiene poca saturación)
+    const gray = new cv.Mat(); cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
+    const hsv = new cv.Mat(); cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+    const hsvCh = new cv.MatVector(); cv.split(hsv, hsvCh);
+    const sat = hsvCh.get(1);
+    cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
+    cv.GaussianBlur(sat, sat, new cv.Size(5, 5), 0);
+    // contraste local realzado: ayuda con hoja blanca sobre mesa clara
+    const eq = new cv.Mat();
+    try { const cl = new cv.CLAHE(3.0, new cv.Size(6, 6)); cl.apply(gray, eq); cl.delete(); }
+    catch (e) { cv.equalizeHist(gray, eq); }
+
+    // magnitud del gradiente para puntuar candidatos
+    const gx = new cv.Mat(), gy = new cv.Mat(), mag = new cv.Mat();
+    cv.Sobel(gray, gx, cv.CV_32F, 1, 0, 3); cv.Sobel(gray, gy, cv.CV_32F, 0, 1, 3);
+    cv.magnitude(gx, gy, mag);
+    const sx = new cv.Mat(), sy = new cv.Mat(), smag = new cv.Mat();
+    cv.Sobel(sat, sx, cv.CV_32F, 1, 0, 3); cv.Sobel(sat, sy, cv.CV_32F, 0, 1, 3);
+    cv.magnitude(sx, sy, smag);
+    cv.max(mag, smag, mag);
+    const magArr = Float32Array.from(mag.data32F);
+    const sortedMag = Float32Array.from(magArr).sort();
+    const thr = Math.max(12, sortedMag[Math.floor(sortedMag.length * 0.9)] * 0.45);
 
     const candidates = [];
+    const k3 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    const k7 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7));
+    const padded = (m) => { const p = new cv.Mat(); cv.copyMakeBorder(m, p, PAD, PAD, PAD, PAD, cv.BORDER_CONSTANT, new cv.Scalar(0)); return p; };
+    const run = (bin, mode) => {
+      const p = padded(bin);
+      const before = candidates.length;
+      quadsFromBinary(cv, p, imgArea, minFrac, mode, candidates);
+      for (let i = before; i < candidates.length; i++) candidates[i] = candidates[i].map((pt) => ({ x: Math.min(W - 1, Math.max(0, pt.x - PAD)), y: Math.min(H - 1, Math.max(0, pt.y - PAD)) }));
+      p.delete();
+    };
 
-    // Estrategia 1: bordes Canny (umbral según la mediana del brillo)
-    const sorted = Array.from(blur.data).sort((a, b) => a - b);
-    const med = sorted[sorted.length >> 1];
-    for (const k of [0.66, 0.33]) {
-      const lo = Math.max(10, (1 - k) * med), hi = Math.min(255, (1 + k) * med);
-      const edges = new cv.Mat();
-      cv.Canny(blur, edges, lo, hi);
-      cv.dilate(edges, edges, kernel, new cv.Point(-1, -1), 2);
-      cv.erode(edges, edges, kernel, new cv.Point(-1, -1), 1);
-      const r = bestQuadFromBinary(cv, edges, imgArea, minFrac);
-      if (r) candidates.push(r);
-      edges.delete();
+    // 1) bordes Canny de gris y de saturación, unidos
+    const med = (() => { const a = Uint8Array.from(gray.data).sort(); return a[a.length >> 1]; })();
+    for (const [src8, lo, hi] of [[gray, 0.5 * med, 1.2 * med], [gray, 20, 60], [gray, 40, 120], [gray, 8, 24], [eq, 30, 90], [eq, 60, 160]]) {
+      const e1 = new cv.Mat(), e2 = new cv.Mat();
+      cv.Canny(src8, e1, Math.max(5, lo), Math.max(15, Math.min(255, hi)));
+      cv.Canny(sat, e2, 20, 60);
+      cv.bitwise_or(e1, e2, e1);
+      cv.dilate(e1, e1, k3, new cv.Point(-1, -1), 1);
+      cv.morphologyEx(e1, e1, cv.MORPH_CLOSE, k7);
+      run(e1, cv.RETR_LIST);
+      e1.delete(); e2.delete();
     }
-
-    // Estrategia 2: papel claro sobre fondo (umbral de Otsu)
-    {
+    // 2) zonas claras (Otsu) y zonas poco saturadas
+    for (const [ch, inv] of [[gray, false], [sat, true]]) {
       const th = new cv.Mat();
-      cv.threshold(blur, th, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-      cv.morphologyEx(th, th, cv.MORPH_CLOSE, kernelBig);
-      cv.morphologyEx(th, th, cv.MORPH_OPEN, kernelBig);
-      const r = bestQuadFromBinary(cv, th, imgArea, minFrac);
-      if (r) candidates.push(r);
+      cv.threshold(ch, th, 0, 255, (inv ? cv.THRESH_BINARY_INV : cv.THRESH_BINARY) + cv.THRESH_OTSU);
+      cv.morphologyEx(th, th, cv.MORPH_OPEN, k7);
+      cv.morphologyEx(th, th, cv.MORPH_CLOSE, k7);
+      run(th, cv.RETR_EXTERNAL);
       th.delete();
     }
 
-    // Estrategia 3: saturación baja (papel blanco) frente a fondo con color
-    {
-      const rgb = new cv.Mat(), hsv = new cv.Mat();
-      cv.cvtColor(small, rgb, cv.COLOR_RGBA2RGB);
-      cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
-      const ch = new cv.MatVector();
-      cv.split(hsv, ch);
-      const s = ch.get(1);
-      const inv = new cv.Mat();
-      cv.GaussianBlur(s, s, new cv.Size(5, 5), 0);
-      cv.threshold(s, inv, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
-      cv.morphologyEx(inv, inv, cv.MORPH_CLOSE, kernelBig);
-      cv.morphologyEx(inv, inv, cv.MORPH_OPEN, kernelBig);
-      const r = bestQuadFromBinary(cv, inv, imgArea, minFrac);
-      if (r) candidates.push(r);
-      inv.delete(); s.delete(); ch.delete(); rgb.delete(); hsv.delete();
-    }
-
-    const tol = 0.04 * Math.max(gray.cols, gray.rows);
-    small.delete(); gray.delete(); blur.delete(); kernel.delete(); kernelBig.delete();
+    [small, rgb, gray, eq, hsv, hsvCh, sat, gx, gy, mag, sx, sy, smag, k3, k7].forEach((m) => m.delete());
     if (!candidates.length) return null;
 
-    // Preferimos el cuadrilátero que más estrategias coinciden en encontrar; si no, el mayor
-    function close(a, b) {
-      return a.quad.every((p, i) => Math.hypot(p.x - b.quad[i].x, p.y - b.quad[i].y) < tol);
+    // Puntuación: lados que coinciden con bordes reales × tamaño
+    let best = null, bestScore = 0;
+    for (const q of candidates) {
+      const sup = edgeSupport(magArr, W, H, thr, q);
+      if (sup.min < 0.3 || sup.mean < 0.5) continue;
+      const areaFrac = polyArea(q) / imgArea;
+      if (areaFrac > 0.97) continue; // es el marco de la foto, no la hoja
+      const score = sup.mean * Math.pow(areaFrac, 0.8);
+      if (score > bestScore) { bestScore = score; best = q; }
     }
-    let best = null, bestScore = -1;
-    for (const c of candidates) {
-      const votes = candidates.filter(o => close(c, o)).length;
-      const score = votes * 10 + c.area / imgArea;
-      if (score > bestScore) { bestScore = score; best = c; }
-    }
-    // Si toca casi todo el borde de la foto, probablemente es el marco y no la hoja
-    const fullFrac = best.area / imgArea;
-    if (fullFrac > 0.985) return null;
-    return best.quad.map(p => ({ x: p.x / scale, y: p.y / scale }));
+    if (!best) return null;
+    return best.map((p) => ({ x: p.x / scale, y: p.y / scale }));
   }
 
   function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
